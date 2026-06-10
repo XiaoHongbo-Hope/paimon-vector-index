@@ -18,15 +18,14 @@
 mod stream;
 
 use jni::objects::{JByteArray, JClass, JFloatArray, JLongArray, JObject, JValue};
-use jni::sys::{jboolean, jint, jlong, jobject};
+use jni::sys::{jint, jlong, jobject, jobjectArray};
 use jni::JNIEnv;
-use paimon_vindex_core::distance::MetricType;
-use paimon_vindex_core::hnsw::HnswBuildParams;
 use paimon_vindex_core::index::{
-    IndexType, VectorIndexConfig, VectorIndexMetadata, VectorIndexReader, VectorIndexWriter,
+    VectorIndexConfig, VectorIndexMetadata, VectorIndexReader, VectorIndexWriter,
     VectorSearchParams,
 };
 use std::any::Any;
+use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use stream::{JniOutputStream, JniSeekableStream};
 
@@ -80,109 +79,85 @@ fn deref_reader(ptr: jlong) -> Option<&'static mut VectorIndexReader<JniSeekable
     }
 }
 
-fn parse_metric(env: &mut JNIEnv, metric: jint) -> Option<MetricType> {
-    match MetricType::from_code(metric as u32) {
-        Some(metric) => Some(metric),
-        None => {
-            throw_and_return::<()>(env, &format!("Unknown metric: {}", metric));
-            None
-        }
-    }
-}
-
-fn parse_index_type(env: &mut JNIEnv, index_type: jint) -> Option<IndexType> {
-    match IndexType::from_code(index_type as u32) {
-        Some(index_type) => Some(index_type),
-        None => {
-            throw_and_return::<()>(env, &format!("Unknown index type: {}", index_type));
-            None
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_config(
+fn build_config_from_options(
     env: &mut JNIEnv,
-    index_type: jint,
-    dimension: jint,
-    nlist: jint,
-    pq_m: jint,
-    metric: jint,
-    use_opq: jboolean,
-    hnsw_m: jint,
-    ef_construction: jint,
-    max_level: jint,
+    keys: jobjectArray,
+    values: jobjectArray,
 ) -> Option<VectorIndexConfig> {
-    if dimension <= 0 || nlist <= 0 {
+    let keys = unsafe { jni::objects::JObjectArray::from_raw(keys) };
+    let values = unsafe { jni::objects::JObjectArray::from_raw(values) };
+    let key_len = match env.get_array_length(&keys) {
+        Ok(len) => len,
+        Err(e) => {
+            throw_and_return::<()>(env, &format!("get_array_length(keys): {}", e));
+            return None;
+        }
+    };
+    let value_len = match env.get_array_length(&values) {
+        Ok(len) => len,
+        Err(e) => {
+            throw_and_return::<()>(env, &format!("get_array_length(values): {}", e));
+            return None;
+        }
+    };
+    if key_len != value_len {
         throw_and_return::<()>(
             env,
             &format!(
-                "invalid parameters: dimension={}, nlist={}",
-                dimension, nlist
+                "options key/value array length mismatch: {} != {}",
+                key_len, value_len
             ),
         );
         return None;
     }
-    let index_type = parse_index_type(env, index_type)?;
-    let metric = parse_metric(env, metric)?;
-    let dimension = dimension as usize;
-    let nlist = nlist as usize;
 
-    Some(match index_type {
-        IndexType::IvfFlat => VectorIndexConfig::IvfFlat {
-            dimension,
-            nlist,
-            metric,
-        },
-        IndexType::IvfPq => {
-            if pq_m <= 0 {
-                throw_and_return::<()>(env, &format!("invalid pq m: {}", pq_m));
+    let mut options = HashMap::with_capacity(key_len as usize);
+    for idx in 0..key_len {
+        let key = match env.get_object_array_element(&keys, idx) {
+            Ok(key) => key,
+            Err(e) => {
+                throw_and_return::<()>(env, &format!("get options key {}: {}", idx, e));
                 return None;
             }
-            VectorIndexConfig::IvfPq {
-                dimension,
-                nlist,
-                m: pq_m as usize,
-                metric,
-                use_opq: use_opq != 0,
+        };
+        let value = match env.get_object_array_element(&values, idx) {
+            Ok(value) => value,
+            Err(e) => {
+                throw_and_return::<()>(env, &format!("get options value {}: {}", idx, e));
+                return None;
             }
+        };
+        let key = match java_string(env, key) {
+            Ok(key) => key,
+            Err(e) => {
+                throw_and_return::<()>(env, &format!("read options key {}: {}", idx, e));
+                return None;
+            }
+        };
+        let value = match java_string(env, value) {
+            Ok(value) => value,
+            Err(e) => {
+                throw_and_return::<()>(env, &format!("read options value {}: {}", idx, e));
+                return None;
+            }
+        };
+        options.insert(key, value);
+    }
+
+    match VectorIndexConfig::from_options(&options) {
+        Ok(config) => Some(config),
+        Err(e) => {
+            throw_and_return::<()>(env, &format!("invalid vector index options: {}", e));
+            None
         }
-        IndexType::IvfHnswFlat => VectorIndexConfig::IvfHnswFlat {
-            dimension,
-            nlist,
-            metric,
-            hnsw: build_hnsw_params(env, hnsw_m, ef_construction, max_level)?,
-        },
-        IndexType::IvfHnswSq => VectorIndexConfig::IvfHnswSq {
-            dimension,
-            nlist,
-            metric,
-            hnsw: build_hnsw_params(env, hnsw_m, ef_construction, max_level)?,
-        },
-    })
+    }
 }
 
-fn build_hnsw_params(
-    env: &mut JNIEnv,
-    hnsw_m: jint,
-    ef_construction: jint,
-    max_level: jint,
-) -> Option<HnswBuildParams> {
-    if hnsw_m <= 0 || ef_construction <= 0 || max_level <= 0 {
-        throw_and_return::<()>(
-            env,
-            &format!(
-                "invalid HNSW parameters: m={}, efConstruction={}, maxLevel={}",
-                hnsw_m, ef_construction, max_level
-            ),
-        );
-        return None;
-    }
-    Some(HnswBuildParams {
-        m: hnsw_m as usize,
-        ef_construction: ef_construction as usize,
-        max_level: max_level as usize,
-    })
+fn java_string(env: &mut JNIEnv, object: JObject) -> Result<String, String> {
+    let string = jni::objects::JString::from(object);
+    env.get_string(&string)
+        .map(|value| value.into())
+        .map_err(|e| format!("get_string: {}", e))
 }
 
 fn read_byte_array(env: &mut JNIEnv, array: JByteArray) -> Result<Vec<u8>, String> {
@@ -194,43 +169,21 @@ fn read_byte_array(env: &mut JNIEnv, array: JByteArray) -> Result<Vec<u8>, Strin
         .map_err(|e| format!("convert_byte_array: {}", e))
 }
 
-fn read_float_array(
-    env: &mut JNIEnv,
-    array: &JFloatArray,
-    expected_len: usize,
-    name: &str,
-) -> Result<Vec<f32>, String> {
+fn read_float_array(env: &mut JNIEnv, array: &JFloatArray, name: &str) -> Result<Vec<f32>, String> {
     let len = env
         .get_array_length(array)
         .map_err(|e| format!("get_array_length({}): {}", name, e))? as usize;
-    if len < expected_len {
-        return Err(format!(
-            "{} array too short: {} < {}",
-            name, len, expected_len
-        ));
-    }
-    let mut buf = vec![0.0f32; expected_len];
+    let mut buf = vec![0.0f32; len];
     env.get_float_array_region(array, 0, &mut buf)
         .map_err(|e| format!("get_float_array_region({}): {}", name, e))?;
     Ok(buf)
 }
 
-fn read_long_array(
-    env: &mut JNIEnv,
-    array: &JLongArray,
-    expected_len: usize,
-    name: &str,
-) -> Result<Vec<i64>, String> {
+fn read_long_array(env: &mut JNIEnv, array: &JLongArray, name: &str) -> Result<Vec<i64>, String> {
     let len = env
         .get_array_length(array)
         .map_err(|e| format!("get_array_length({}): {}", name, e))? as usize;
-    if len < expected_len {
-        return Err(format!(
-            "{} array too short: {} < {}",
-            name, len, expected_len
-        ));
-    }
-    let mut buf = vec![0i64; expected_len];
+    let mut buf = vec![0i64; len];
     env.get_long_array_region(array, 0, &mut buf)
         .map_err(|e| format!("get_long_array_region({}): {}", name, e))?;
     Ok(buf)
@@ -339,7 +292,7 @@ fn build_metadata(env: &mut JNIEnv, metadata: VectorIndexMetadata) -> jobject {
 }
 
 fn search_params(k: jint, nprobe: jint, ef_search: jint) -> Option<VectorSearchParams> {
-    if k <= 0 || nprobe <= 0 || ef_search < 0 {
+    if k < 0 || nprobe < 0 || ef_search < 0 {
         None
     } else {
         Some(VectorSearchParams::with_ef_search(
@@ -353,33 +306,14 @@ fn search_params(k: jint, nprobe: jint, ef_search: jint) -> Option<VectorSearchP
 // --- Unified Writer API ---
 
 #[no_mangle]
-#[allow(clippy::too_many_arguments)]
 pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_createWriter(
     env: JNIEnv,
     _class: JClass,
-    index_type: jint,
-    dimension: jint,
-    nlist: jint,
-    pq_m: jint,
-    metric: jint,
-    use_opq: jboolean,
-    hnsw_m: jint,
-    ef_construction: jint,
-    max_level: jint,
+    keys: jobjectArray,
+    values: jobjectArray,
 ) -> jlong {
     jni_call(env, |env| {
-        let config = match build_config(
-            env,
-            index_type,
-            dimension,
-            nlist,
-            pq_m,
-            metric,
-            use_opq,
-            hnsw_m,
-            ef_construction,
-            max_level,
-        ) {
+        let config = match build_config_from_options(env, keys, values) {
             Some(config) => config,
             None => return 0,
         };
@@ -405,21 +339,32 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_trai
             Some(writer) => writer,
             None => return throw_and_return(env, "null native pointer (writer already freed?)"),
         };
-        if n <= 0 {
+        if n < 0 {
             return throw_and_return(env, &format!("invalid vector count: {}", n));
         }
         let n = n as usize;
-        let expected_len = match n.checked_mul(writer.dimension()) {
-            Some(len) => len,
-            None => return throw_and_return(env, "vector count * dimension overflow"),
-        };
-        let data_buf = match read_float_array(env, &data, expected_len, "data") {
+        let data_buf = match read_float_array(env, &data, "data") {
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
         if let Err(e) = writer.train(&data_buf, n) {
             throw_and_return::<()>(env, &format!("train: {}", e));
         }
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_writerDimension(
+    env: JNIEnv,
+    _class: JClass,
+    ptr: jlong,
+) -> jint {
+    jni_call(env, |env| {
+        let writer = match deref_writer(ptr) {
+            Some(writer) => writer,
+            None => return throw_and_return(env, "null native pointer (writer already freed?)"),
+        };
+        writer.dimension() as jint
     })
 }
 
@@ -437,19 +382,15 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_addV
             Some(writer) => writer,
             None => return throw_and_return(env, "null native pointer (writer already freed?)"),
         };
-        if n <= 0 {
+        if n < 0 {
             return throw_and_return(env, &format!("invalid vector count: {}", n));
         }
         let n = n as usize;
-        let expected_len = match n.checked_mul(writer.dimension()) {
-            Some(len) => len,
-            None => return throw_and_return(env, "vector count * dimension overflow"),
-        };
-        let id_buf = match read_long_array(env, &ids, n, "ids") {
+        let id_buf = match read_long_array(env, &ids, "ids") {
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
-        let data_buf = match read_float_array(env, &data, expected_len, "data") {
+        let data_buf = match read_float_array(env, &data, "data") {
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
@@ -572,7 +513,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
                 )
             }
         };
-        let query_buf = match read_float_array(env, &query, reader.dimension(), "query") {
+        let query_buf = match read_float_array(env, &query, "query") {
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
@@ -612,7 +553,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
                 )
             }
         };
-        let query_buf = match read_float_array(env, &query, reader.dimension(), "query") {
+        let query_buf = match read_float_array(env, &query, "query") {
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
@@ -645,7 +586,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
             Some(reader) => reader,
             None => return throw_and_return(env, "null native pointer (reader already freed?)"),
         };
-        if query_count <= 0 {
+        if query_count < 0 {
             return throw_and_return(env, &format!("invalid query count: {}", query_count));
         }
         let params = match search_params(k, nprobe, ef_search) {
@@ -661,11 +602,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
             }
         };
         let nq = query_count as usize;
-        let expected_len = match nq.checked_mul(reader.dimension()) {
-            Some(len) => len,
-            None => return throw_and_return(env, "query count * dimension overflow"),
-        };
-        let query_buf = match read_float_array(env, &queries, expected_len, "queries") {
+        let query_buf = match read_float_array(env, &queries, "queries") {
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };
@@ -694,7 +631,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
             Some(reader) => reader,
             None => return throw_and_return(env, "null native pointer (reader already freed?)"),
         };
-        if query_count <= 0 {
+        if query_count < 0 {
             return throw_and_return(env, &format!("invalid query count: {}", query_count));
         }
         let params = match search_params(k, nprobe, ef_search) {
@@ -710,11 +647,7 @@ pub extern "system" fn Java_org_apache_paimon_index_ivfpq_VectorIndexNative_sear
             }
         };
         let nq = query_count as usize;
-        let expected_len = match nq.checked_mul(reader.dimension()) {
-            Some(len) => len,
-            None => return throw_and_return(env, "query count * dimension overflow"),
-        };
-        let query_buf = match read_float_array(env, &queries, expected_len, "queries") {
+        let query_buf = match read_float_array(env, &queries, "queries") {
             Ok(buf) => buf,
             Err(e) => return throw_and_return(env, &e),
         };

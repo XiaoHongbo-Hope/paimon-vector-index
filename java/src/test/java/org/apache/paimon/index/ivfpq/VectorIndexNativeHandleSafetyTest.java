@@ -18,6 +18,8 @@
 package org.apache.paimon.index.ivfpq;
 
 import java.io.ByteArrayOutputStream;
+import java.util.HashMap;
+import java.util.Map;
 
 public class VectorIndexNativeHandleSafetyTest {
 
@@ -73,11 +75,19 @@ public class VectorIndexNativeHandleSafetyTest {
     }
 
     private static VectorIndexWriter newPopulatedWriter() {
-        VectorIndexWriter writer =
-                new VectorIndexWriter(VectorIndexConfig.ivfFlat(1, 1, Metric.L2));
+        VectorIndexWriter writer = new VectorIndexWriter(ivfFlatOptions());
         writer.train(new float[] {0.0f, 1.0f}, 2);
         writer.addVectors(new long[] {1L, 2L}, new float[] {0.0f, 1.0f}, 2);
         return writer;
+    }
+
+    private static Map<String, String> ivfFlatOptions() {
+        Map<String, String> options = new HashMap<String, String>();
+        options.put("index.type", "ivf_flat");
+        options.put("dimension", "1");
+        options.put("nlist", "1");
+        options.put("metric", "l2");
+        return options;
     }
 
     private static void assertEquals(int expected, int actual) {

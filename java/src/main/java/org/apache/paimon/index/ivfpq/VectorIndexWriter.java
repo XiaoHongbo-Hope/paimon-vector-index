@@ -17,51 +17,42 @@
 
 package org.apache.paimon.index.ivfpq;
 
+import java.util.Map;
+
 public final class VectorIndexWriter implements AutoCloseable {
 
-    private final VectorIndexConfig config;
     private final Object nativeHandleLock = new Object();
     private long nativePtr;
     private Thread nativeHandleOwner;
 
-    public VectorIndexWriter(VectorIndexConfig config) {
-        if (config == null) {
-            throw new NullPointerException("config");
+    public VectorIndexWriter(Map<String, String> options) {
+        String[] keys = new String[options.size()];
+        String[] values = new String[options.size()];
+        int index = 0;
+        for (Map.Entry<String, String> entry : options.entrySet()) {
+            keys[index] = entry.getKey();
+            values[index] = entry.getValue();
+            index++;
         }
-        this.config = config;
-        HnswConfig hnsw = config.hnsw();
-        this.nativePtr =
-                VectorIndexNative.createWriter(
-                        config.indexType().code(),
-                        config.dimension(),
-                        config.nlist(),
-                        config.pqM(),
-                        config.metric().code(),
-                        config.useOpq(),
-                        hnsw.m(),
-                        hnsw.efConstruction(),
-                        hnsw.maxLevel());
+        this.nativePtr = VectorIndexNative.createWriter(keys, values);
     }
 
-    private VectorIndexWriter(long nativePtr, VectorIndexConfig config) {
+    private VectorIndexWriter(long nativePtr) {
         this.nativePtr = nativePtr;
-        this.config = config;
     }
 
-    static VectorIndexWriter fromNativePointerForTesting(long nativePtr, VectorIndexConfig config) {
-        return new VectorIndexWriter(nativePtr, config);
-    }
-
-    public VectorIndexConfig config() {
-        return config;
+    static VectorIndexWriter fromNativePointerForTesting(long nativePtr) {
+        return new VectorIndexWriter(nativePtr);
     }
 
     public int dimension() {
-        return config.dimension();
+        return VectorIndexNative.writerDimension(requireOpen());
     }
 
     public void train(float[] data, int vectorCount) {
-        validateVectors(data, vectorCount);
+        if (data == null) {
+            throw new NullPointerException("data");
+        }
         synchronized (nativeHandleLock) {
             enterNativeHandle();
             try {
@@ -76,10 +67,8 @@ public final class VectorIndexWriter implements AutoCloseable {
         if (ids == null) {
             throw new NullPointerException("ids");
         }
-        validateVectors(data, vectorCount);
-        if (ids.length < vectorCount) {
-            throw new IllegalArgumentException(
-                    "ids length " + ids.length + " < vectorCount " + vectorCount);
+        if (data == null) {
+            throw new NullPointerException("data");
         }
         synchronized (nativeHandleLock) {
             enterNativeHandle();
@@ -118,21 +107,6 @@ public final class VectorIndexWriter implements AutoCloseable {
             } finally {
                 exitNativeHandle();
             }
-        }
-    }
-
-    private void validateVectors(float[] data, int vectorCount) {
-        if (data == null) {
-            throw new NullPointerException("data");
-        }
-        VectorIndexConfig.validatePositive(vectorCount, "vectorCount");
-        long expected = (long) vectorCount * (long) config.dimension();
-        if (expected > Integer.MAX_VALUE) {
-            throw new IllegalArgumentException("vectorCount * dimension overflows int");
-        }
-        if (data.length < expected) {
-            throw new IllegalArgumentException(
-                    "data length " + data.length + " < vectorCount * dimension " + expected);
         }
     }
 
