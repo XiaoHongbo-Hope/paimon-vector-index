@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::distance::MetricType;
+use crate::index_io_util::{decode_delta_varint_ids, encode_delta_varint_ids};
 use crate::ivfpq::IVFPQIndex;
 use crate::opq::OPQMatrix;
 use crate::pq::ProductQuantizer;
@@ -114,91 +115,6 @@ impl<W: io::Write + Send> SeekWrite for PosWriter<W> {
     fn pos(&self) -> u64 {
         self.pos
     }
-}
-
-// --- Varint encoding ---
-
-fn encode_varint(mut val: u64, buf: &mut Vec<u8>) {
-    while val >= 0x80 {
-        buf.push((val as u8) | 0x80);
-        val >>= 7;
-    }
-    buf.push(val as u8);
-}
-
-fn decode_varint(buf: &[u8], pos: &mut usize) -> io::Result<u64> {
-    let mut val: u64 = 0;
-    let mut shift = 0u32;
-    loop {
-        if *pos >= buf.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "truncated varint",
-            ));
-        }
-        let b = buf[*pos] as u64;
-        *pos += 1;
-        let payload = b & 0x7F;
-        if shift == 63 && payload > 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "varint exceeds u64 range",
-            ));
-        }
-        val |= payload << shift;
-        if b & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-        if shift > 63 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "varint exceeds 64 bits",
-            ));
-        }
-    }
-    Ok(val)
-}
-
-/// Encode sorted i64 IDs as delta-varint. Returns (base_id, encoded_bytes).
-/// Uses unsigned subtraction to handle the full i64 range without overflow.
-fn encode_delta_varint_ids(ids: &[i64]) -> (i64, Vec<u8>) {
-    if ids.is_empty() {
-        return (0, Vec::new());
-    }
-    let base = ids[0];
-    let mut buf = Vec::with_capacity(ids.len() * 2);
-    let mut prev = base;
-    for &id in ids {
-        let delta = (id as u64).wrapping_sub(prev as u64);
-        encode_varint(delta, &mut buf);
-        prev = id;
-    }
-    (base, buf)
-}
-
-/// Decode delta-varint encoded IDs using wrapping unsigned arithmetic
-/// (inverse of encode_delta_varint_ids). Validates monotonically non-decreasing
-/// signed order — rejects corrupt data that would wrap around.
-fn decode_delta_varint_ids(base: i64, buf: &[u8], count: usize) -> io::Result<Vec<i64>> {
-    let mut ids = Vec::with_capacity(count);
-    let mut pos = 0;
-    let mut current = base as u64;
-    let mut prev_signed = base;
-    for _ in 0..count {
-        let delta = decode_varint(buf, &mut pos)?;
-        current = current.wrapping_add(delta);
-        let id = current as i64;
-        if id < prev_signed {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "decoded ID sequence is not monotonically non-decreasing",
-            ));
-        }
-        prev_signed = id;
-        ids.push(id);
-    }
-    Ok(ids)
 }
 
 // --- Read/write helpers ---
@@ -310,6 +226,11 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
     let ksub = index.pq.ksub;
     let dsub = index.pq.dsub;
     let code_size = index.pq.code_size();
+    let d_i32 = usize_to_i32(d, "dimension")?;
+    let nlist_i32 = usize_to_i32(nlist, "nlist")?;
+    let m_i32 = usize_to_i32(m, "pq m")?;
+    let ksub_i32 = usize_to_i32(ksub, "pq ksub")?;
+    let dsub_i32 = usize_to_i32(dsub, "pq dsub")?;
 
     let mut flags: u32 = FLAG_DELTA_IDS | FLAG_TRANSPOSED_CODES;
     if index.opq.is_some() {
@@ -319,7 +240,15 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
         flags |= FLAG_BY_RESIDUAL;
     }
 
-    let total_vectors: i64 = index.ids.iter().map(|l| l.len() as i64).sum();
+    let total_vectors = index.ids.iter().try_fold(0i64, |sum, ids| {
+        let count = usize_to_i64(ids.len(), "total vector count")?;
+        sum.checked_add(count).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "total vector count exceeds i64 length limit",
+            )
+        })
+    })?;
 
     // Sort IDs within each list and prepare delta-varint encoded data
     let mut sorted_lists: Vec<(Vec<i64>, Vec<u8>, Vec<u8>)> = Vec::with_capacity(nlist);
@@ -335,7 +264,8 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
         indices.sort_by_key(|&idx| index.ids[i][idx]);
 
         let sorted_ids: Vec<i64> = indices.iter().map(|&idx| index.ids[i][idx]).collect();
-        let mut sorted_codes = vec![0u8; count * code_size];
+        let code_bytes = checked_list_bytes(count, code_size)?;
+        let mut sorted_codes = vec![0u8; code_bytes];
         for (new_idx, &old_idx) in indices.iter().enumerate() {
             sorted_codes[new_idx * code_size..(new_idx + 1) * code_size]
                 .copy_from_slice(&index.codes[i][old_idx * code_size..(old_idx + 1) * code_size]);
@@ -348,11 +278,11 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
     // Header
     write_u32_le(out, MAGIC)?;
     write_u32_le(out, VERSION)?;
-    write_i32_le(out, d as i32)?;
-    write_i32_le(out, nlist as i32)?;
-    write_i32_le(out, m as i32)?;
-    write_i32_le(out, ksub as i32)?;
-    write_i32_le(out, dsub as i32)?;
+    write_i32_le(out, d_i32)?;
+    write_i32_le(out, nlist_i32)?;
+    write_i32_le(out, m_i32)?;
+    write_i32_le(out, ksub_i32)?;
+    write_i32_le(out, dsub_i32)?;
     write_u32_le(out, index.metric as u32)?;
     write_i64_le(out, total_vectors)?;
     write_u32_le(out, flags)?;
@@ -367,8 +297,21 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
 
     // Compute offsets for inverted lists
     // Delta-varint format per list: [base_id: i64][id_bytes_len: u32][id_bytes][codes]
-    let offset_table_size = nlist * 16;
-    let data_start = out.pos() + offset_table_size as u64;
+    let offset_table_size = nlist.checked_mul(16).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "IVFPQ offset table size overflow",
+        )
+    })?;
+    let data_start = out
+        .pos()
+        .checked_add(offset_table_size as u64)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "IVFPQ data start offset overflow",
+            )
+        })?;
 
     let mut list_offsets = vec![0i64; nlist];
     let mut list_counts = vec![0i32; nlist];
@@ -376,20 +319,25 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
     let mut current_offset = data_start;
 
     for i in 0..nlist {
-        list_offsets[i] = current_offset as i64;
+        list_offsets[i] = u64_to_i64(current_offset, "list offset")?;
         let count = sorted_lists[i].0.len();
-        list_counts[i] = count as i32;
+        list_counts[i] = usize_to_i32(count, "list count")?;
         if count > 0 {
             // base_id(8) + id_bytes_len(4) + id_bytes + codes
             let id_bytes_len = sorted_lists[i].1.len();
-            if id_bytes_len > i32::MAX as usize {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "delta ID section exceeds i32 length limit",
-                ));
-            }
-            list_id_bytes_lens[i] = id_bytes_len as i32;
-            current_offset += 8 + 4 + id_bytes_len as u64 + (count * code_size) as u64;
+            list_id_bytes_lens[i] = usize_to_i32(id_bytes_len, "delta ID section")?;
+            let code_bytes = checked_list_bytes(count, code_size)?;
+            let list_bytes = 12usize
+                .checked_add(id_bytes_len)
+                .and_then(|len| len.checked_add(code_bytes))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "IVFPQ list size overflow")
+                })?;
+            current_offset = current_offset
+                .checked_add(list_bytes as u64)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "IVFPQ offset overflow")
+                })?;
         }
     }
 
@@ -409,13 +357,14 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
         // base_id
         write_i64_le(out, sorted_ids[0])?;
         // id_bytes_len + id_bytes
-        write_i32_le(out, id_bytes.len() as i32)?;
+        write_i32_le(out, usize_to_i32(id_bytes.len(), "delta ID section")?)?;
         out.write_all(id_bytes)?;
         // PQ codes — transpose for cache-friendly SIMD scan
         let count = sorted_ids.len();
         if code_size == m {
             // 8-bit: transpose from [n][M] to [M][n]
-            let mut transposed = vec![0u8; count * m];
+            let transposed_len = checked_list_bytes(count, m)?;
+            let mut transposed = vec![0u8; transposed_len];
             for vec_idx in 0..count {
                 for sub in 0..m {
                     transposed[sub * count + vec_idx] = sorted_codes[vec_idx * m + sub];
@@ -426,7 +375,8 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
             // 4-bit: transpose from [n][M/2] to [M/2][n]
             // Each byte at position `pair` in a vector goes to column `pair`
             let cs = code_size;
-            let mut transposed = vec![0u8; count * cs];
+            let transposed_len = checked_list_bytes(count, cs)?;
+            let mut transposed = vec![0u8; transposed_len];
             for vec_idx in 0..count {
                 for pair in 0..cs {
                     transposed[pair * count + vec_idx] = sorted_codes[vec_idx * cs + pair];
@@ -437,6 +387,36 @@ pub fn write_index(index: &IVFPQIndex, out: &mut dyn SeekWrite) -> io::Result<()
     }
 
     Ok(())
+}
+
+fn usize_to_i32(value: usize, field: &str) -> io::Result<i32> {
+    if value > i32::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} exceeds i32 length limit: {}", field, value),
+        ));
+    }
+    Ok(value as i32)
+}
+
+fn usize_to_i64(value: usize, field: &str) -> io::Result<i64> {
+    if value > i64::MAX as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} exceeds i64 length limit: {}", field, value),
+        ));
+    }
+    Ok(value as i64)
+}
+
+fn u64_to_i64(value: u64, field: &str) -> io::Result<i64> {
+    if value > i64::MAX as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} exceeds i64 offset limit: {}", field, value),
+        ));
+    }
+    Ok(value as i64)
 }
 
 // --- Reader ---
@@ -954,27 +934,19 @@ mod tests {
 
     #[test]
     fn test_varint_roundtrip() {
-        let mut buf = Vec::new();
-        encode_varint(0, &mut buf);
-        encode_varint(127, &mut buf);
-        encode_varint(128, &mut buf);
-        encode_varint(16383, &mut buf);
-        encode_varint(1_000_000, &mut buf);
-
-        let mut pos = 0;
-        assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 0);
-        assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 127);
-        assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 128);
-        assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 16383);
-        assert_eq!(decode_varint(&buf, &mut pos).unwrap(), 1_000_000);
+        let ids = [0, 127, 128, 16_383, 1_000_000];
+        let (base, encoded) = encode_delta_varint_ids(&ids);
+        assert_eq!(
+            decode_delta_varint_ids(base, &encoded, ids.len()).unwrap(),
+            ids
+        );
     }
 
     #[test]
     fn test_varint_above_u64_max_returns_error() {
         let mut bytes = vec![0xFFu8; 9];
         bytes.push(0x02); // 10th byte with payload > 1 at shift=63
-        let mut pos = 0;
-        assert!(decode_varint(&bytes, &mut pos).is_err());
+        assert!(decode_delta_varint_ids(0, &bytes, 1).is_err());
     }
 
     #[test]
@@ -1297,8 +1269,8 @@ mod tests {
     #[test]
     fn test_delta_ids_wraparound_returns_error() {
         // base_id = i64::MAX, delta = 1 would wrap to i64::MIN (non-monotonic)
-        let mut id_bytes = Vec::new();
-        encode_varint(1, &mut id_bytes);
+        let (_, id_bytes) = encode_delta_varint_ids(&[i64::MAX, i64::MIN]);
+        let id_bytes = id_bytes[1..].to_vec();
         let result = decode_delta_varint_ids(i64::MAX, &id_bytes, 1);
         assert!(
             result.is_err(),

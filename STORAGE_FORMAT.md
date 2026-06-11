@@ -55,15 +55,21 @@ decoded sequence that is not monotonically non-decreasing in signed order.
 ### HNSW Graph Section
 
 IVF-HNSW-FLAT and IVF-HNSW-SQ store one graph section per non-empty list. The
-section is a contiguous sequence of little-endian `u32` values:
+section starts with a fixed header, followed by a contiguous sequence of
+unsigned LEB128 varints. Neighbor ids within each adjacency group are sorted by
+local vector id and stored as unsigned deltas from the previous neighbor id,
+with an initial previous id of `0`:
 
 | Field | Count |
 | --- | --- |
-| `graph_count` | 1 |
-| `entry_point` | 1 |
-| `max_observed_level` | 1 |
-| `level[node]` | `graph_count` |
-| `degree[node][level]` followed by neighbor ids | one group for each node level |
+| `graph_magic` | 1 little-endian `u32`, `HWGR` (`0x48574752`) |
+| `graph_version` | 1 little-endian `u32`, currently `1` |
+| `graph_flags` | 1 little-endian `u32`; bit 0 delta-varint adjacency is required |
+| `graph_count` | 1 varint |
+| `entry_point` | 1 varint |
+| `max_observed_level` | 1 varint |
+| `level[node]` | `graph_count` varints |
+| `degree[node][level]` followed by neighbor id deltas | one group for each node level |
 
 Each node has levels `0..=level[node]`. A level-0 node may have at most `2 * m`
 neighbors, and higher levels may have at most `m` neighbors.
@@ -167,20 +173,30 @@ Magic: `IHFL` (`0x4948464C`). Version: `1`. Header size: 64 bytes.
 | 28 | 4 | `i32` | HNSW `m` |
 | 32 | 4 | `i32` | HNSW `ef_construction` |
 | 36 | 4 | `i32` | HNSW `max_level` |
-| 40 | 24 | bytes | reserved |
+| 40 | 4 | `u32` | flags |
+| 44 | 20 | bytes | reserved |
+
+Flags:
+
+| Bit | Meaning |
+| ---: | --- |
+| 0 | sorted delta-varint ids are stored; required in v1 |
+| 1 | HNSW graph section uses the v1 delta-varint graph encoding; required in v1 |
 
 Sections after the header:
 
 1. IVF coarse centroids: `nlist * d` `f32` values.
 2. Offset table: `nlist` entries of
-   `(offset: i64, count: i32, graph_bytes_len: i32, reserved: i64)`.
+   `(offset: i64, count: i32, graph_bytes_len: i32, payload_bytes_len: i64)`.
 3. List payloads.
 
 For each non-empty list payload:
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `ids` | `count` `i64` | row ids in list order |
+| `base_id` | `i64` | first sorted row id |
+| `id_bytes_len` | `i32` | byte length of encoded id stream |
+| `id_bytes` | bytes | delta-varint ids |
 | `vectors` | `count * d` `f32` | raw stored vectors |
 | `graph` | bytes | HNSW graph section |
 
@@ -201,7 +217,15 @@ Magic: `IHSQ` (`0x49485351`). Version: `1`. Header size: 64 bytes.
 | 36 | 4 | `i32` | HNSW `max_level` |
 | 40 | 4 | `f32` | global minimum SQ bound summary |
 | 44 | 4 | `f32` | global maximum SQ bound summary |
-| 48 | 16 | bytes | reserved |
+| 48 | 4 | `u32` | flags |
+| 52 | 12 | bytes | reserved |
+
+Flags:
+
+| Bit | Meaning |
+| ---: | --- |
+| 0 | sorted delta-varint ids are stored; required in v1 |
+| 1 | HNSW graph section uses the v1 delta-varint graph encoding; required in v1 |
 
 Sections after the header:
 
@@ -211,13 +235,15 @@ Sections after the header:
    max `f32` values.
 4. IVF coarse centroids: `nlist * d` `f32` values.
 5. Offset table: `nlist` entries of
-   `(offset: i64, count: i32, graph_bytes_len: i32, reserved: i64)`.
+   `(offset: i64, count: i32, graph_bytes_len: i32, payload_bytes_len: i64)`.
 6. List payloads.
 
 For each non-empty list payload:
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `ids` | `count` `i64` | row ids in list order |
+| `base_id` | `i64` | first sorted row id |
+| `id_bytes_len` | `i32` | byte length of encoded id stream |
+| `id_bytes` | bytes | delta-varint ids |
 | `codes` | bytes | scalar quantized residual codes, `count * d` bytes |
 | `graph` | bytes | HNSW graph section over decoded vectors |

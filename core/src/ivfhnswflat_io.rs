@@ -19,10 +19,11 @@ use crate::distance::{fvec_distance, preprocess_vectors, MetricType};
 use crate::hnsw::{HnswBuildParams, HnswGraph};
 use crate::hnsw_search::{search_hnsw_lists, HnswSearchList};
 use crate::index_io_util::{
-    bytes_to_f32_vec, checked_list_bytes, checked_list_offset, checked_section_size, decode_graph,
-    decode_roaring_filter, encode_graph, read_f32_vec, read_i32_le, read_i64_le, read_u32_le,
-    u64_to_i64, usize_to_i32, usize_to_i64, validate_positive_i32, validate_search_inputs,
-    write_f32_slice, write_i32_le, write_i64_le, write_u32_le,
+    bytes_to_f32_vec, checked_list_bytes, checked_list_offset, checked_section_size,
+    decode_delta_varint_ids, decode_graph, decode_roaring_filter, encode_delta_varint_ids,
+    encode_graph, read_f32_vec, read_i32_le, read_i64_le, read_u32_le, u64_to_i64, usize_to_i32,
+    usize_to_i64, validate_positive_i32, validate_search_inputs, write_f32_slice, write_i32_le,
+    write_i64_le, write_u32_le,
 };
 use crate::io::{PreadCursor, ReadRequest, SeekRead, SeekWrite};
 use crate::ivfhnswflat::IVFHNSWFlatIndex;
@@ -34,6 +35,10 @@ use std::io;
 pub const IVF_HNSW_FLAT_MAGIC: u32 = 0x4948464C; // "IHFL"
 pub const IVF_HNSW_FLAT_VERSION: u32 = 1;
 pub const IVF_HNSW_FLAT_HEADER_SIZE: usize = 64;
+const FLAG_DELTA_IDS: u32 = 1 << 0;
+const FLAG_GRAPH_V1: u32 = 1 << 1;
+const REQUIRED_FLAGS: u32 = FLAG_DELTA_IDS | FLAG_GRAPH_V1;
+const SUPPORTED_FLAGS: u32 = REQUIRED_FLAGS;
 const MAX_COALESCED_READ_GAP_BYTES: u64 = 1 << 20;
 
 pub fn write_ivfhnswflat_index(
@@ -52,14 +57,8 @@ pub fn write_ivfhnswflat_index(
             )
         })
     })?;
-    let graph_bytes: Vec<Vec<u8>> = (0..nlist)
-        .map(|list_id| {
-            if index.flat.ids[list_id].is_empty() {
-                Ok(Vec::new())
-            } else {
-                encode_graph(index.graphs[list_id].as_ref())
-            }
-        })
+    let sorted_lists: Vec<SortedFlatGraphList> = (0..nlist)
+        .map(|list_id| build_sorted_flat_graph_list(index, list_id))
         .collect::<io::Result<_>>()?;
 
     write_u32_le(out, IVF_HNSW_FLAT_MAGIC)?;
@@ -75,7 +74,8 @@ pub fn write_ivfhnswflat_index(
         usize_to_i32(params.ef_construction, "hnsw ef_construction")?,
     )?;
     write_i32_le(out, usize_to_i32(params.max_level, "hnsw max_level")?)?;
-    out.write_all(&[0u8; 24])?;
+    write_u32_le(out, REQUIRED_FLAGS)?;
+    out.write_all(&[0u8; 20])?;
 
     write_f32_slice(out, &index.flat.quantizer_centroids)?;
 
@@ -97,15 +97,23 @@ pub fn write_ivfhnswflat_index(
     let mut list_offsets = vec![0i64; nlist];
     let mut list_counts = vec![0i32; nlist];
     let mut list_graph_bytes_lens = vec![0i32; nlist];
+    let mut list_payload_bytes_lens = vec![0i64; nlist];
     let mut current_offset = data_start;
 
     for list_id in 0..nlist {
         list_offsets[list_id] = u64_to_i64(current_offset, "list offset")?;
-        let count = index.flat.ids[list_id].len();
+        let count = sorted_lists[list_id].ids.len();
         list_counts[list_id] = usize_to_i32(count, "list count")?;
-        list_graph_bytes_lens[list_id] = usize_to_i32(graph_bytes[list_id].len(), "graph bytes")?;
+        list_graph_bytes_lens[list_id] =
+            usize_to_i32(sorted_lists[list_id].graph_bytes.len(), "graph bytes")?;
         if count > 0 {
-            let payload_len = list_payload_len(count, d, graph_bytes[list_id].len())?;
+            let payload_len = list_payload_len(
+                count,
+                d,
+                sorted_lists[list_id].id_bytes.len(),
+                sorted_lists[list_id].graph_bytes.len(),
+            )?;
+            list_payload_bytes_lens[list_id] = usize_to_i64(payload_len, "list payload bytes")?;
             current_offset = current_offset
                 .checked_add(payload_len as u64)
                 .ok_or_else(|| {
@@ -118,18 +126,19 @@ pub fn write_ivfhnswflat_index(
         write_i64_le(out, list_offsets[list_id])?;
         write_i32_le(out, list_counts[list_id])?;
         write_i32_le(out, list_graph_bytes_lens[list_id])?;
-        write_i64_le(out, 0)?;
+        write_i64_le(out, list_payload_bytes_lens[list_id])?;
     }
 
     for list_id in 0..nlist {
-        if index.flat.ids[list_id].is_empty() {
+        let list = &sorted_lists[list_id];
+        if list.ids.is_empty() {
             continue;
         }
-        for &id in &index.flat.ids[list_id] {
-            write_i64_le(out, id)?;
-        }
-        write_f32_slice(out, &index.flat.vectors[list_id])?;
-        out.write_all(&graph_bytes[list_id])?;
+        write_i64_le(out, list.ids[0])?;
+        write_i32_le(out, usize_to_i32(list.id_bytes.len(), "delta ID section")?)?;
+        out.write_all(&list.id_bytes)?;
+        write_f32_slice(out, &list.vectors)?;
+        out.write_all(&list.graph_bytes)?;
     }
 
     Ok(())
@@ -146,6 +155,7 @@ pub struct IVFHNSWFlatIndexReader<R: SeekRead> {
     pub list_offsets: Vec<i64>,
     pub list_counts: Vec<i32>,
     pub list_graph_bytes_lens: Vec<i32>,
+    pub list_payload_bytes_lens: Vec<i64>,
     loaded: bool,
 }
 
@@ -187,8 +197,22 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
             max_level: validate_positive_i32(read_i32_le(&mut cursor)?, "hnsw max_level")? as usize,
         }
         .sanitized();
-        let mut reserved = [0u8; 24];
+        let flags = read_u32_le(&mut cursor)?;
+        let mut reserved = [0u8; 20];
         cursor.read_exact(&mut reserved)?;
+        let unknown_flags = flags & !SUPPORTED_FLAGS;
+        if unknown_flags != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported IVF_HNSW_FLAT flags: 0x{:08X}", unknown_flags),
+            ));
+        }
+        if flags & REQUIRED_FLAGS != REQUIRED_FLAGS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF_HNSW_FLAT v1 requires delta-varint IDs and graph v1",
+            ));
+        }
 
         Ok(Self {
             reader,
@@ -201,6 +225,7 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
             list_offsets: Vec::new(),
             list_counts: Vec::new(),
             list_graph_bytes_lens: Vec::new(),
+            list_payload_bytes_lens: Vec::new(),
             loaded: false,
         })
     }
@@ -216,6 +241,7 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
         self.list_offsets = vec![0; self.nlist];
         self.list_counts = vec![0; self.nlist];
         self.list_graph_bytes_lens = vec![0; self.nlist];
+        self.list_payload_bytes_lens = vec![0; self.nlist];
         for list_id in 0..self.nlist {
             self.list_offsets[list_id] = read_i64_le(&mut cursor)?;
             let count = read_i32_le(&mut cursor)?;
@@ -237,7 +263,17 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
                 ));
             }
             self.list_graph_bytes_lens[list_id] = graph_bytes_len;
-            let _reserved = read_i64_le(&mut cursor)?;
+            let payload_bytes_len = read_i64_le(&mut cursor)?;
+            if payload_bytes_len < 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "negative payload_bytes_len {} at list {}",
+                        payload_bytes_len, list_id
+                    ),
+                ));
+            }
+            self.list_payload_bytes_lens[list_id] = payload_bytes_len;
         }
 
         self.loaded = true;
@@ -402,7 +438,28 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
                 format!("list {} is missing HNSW graph", list_id),
             ));
         }
-        let payload_len = list_payload_len(count, self.d, graph_bytes_len)?;
+        let payload_len = self.list_payload_bytes_lens[list_id] as usize;
+        if payload_len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("list {} is missing payload length", list_id),
+            ));
+        }
+        let minimum_payload_len = 12usize.checked_add(graph_bytes_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF-HNSW-FLAT minimum payload length overflow",
+            )
+        })?;
+        if payload_len < minimum_payload_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "list {} payload length {} is shorter than expected {}",
+                    list_id, payload_len, minimum_payload_len
+                ),
+            ));
+        }
         Ok(Some(ListPayloadMeta {
             list_id,
             offset,
@@ -427,7 +484,31 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
                 ),
             ));
         }
-        let ids_bytes_len = checked_list_bytes(meta.count, 8)?;
+        let base_header_len = 12usize;
+        if payload.len() < base_header_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("list {} has truncated ID header", meta.list_id),
+            ));
+        }
+        let base_id = i64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let id_bytes_len = i32::from_le_bytes(payload[8..12].try_into().unwrap());
+        if id_bytes_len < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "negative id_bytes_len {} at list {}",
+                    id_bytes_len, meta.list_id
+                ),
+            ));
+        }
+        let id_bytes_len = id_bytes_len as usize;
+        let ids_end = base_header_len.checked_add(id_bytes_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF-HNSW-FLAT ID payload length overflow",
+            )
+        })?;
         let vector_bytes_len = checked_list_bytes(
             meta.count,
             self.d.checked_mul(4).ok_or_else(|| {
@@ -437,13 +518,22 @@ impl<R: SeekRead> IVFHNSWFlatIndexReader<R> {
                 )
             })?,
         )?;
-        let ids = payload[..ids_bytes_len]
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        let vectors = bytes_to_f32_vec(&payload[ids_bytes_len..ids_bytes_len + vector_bytes_len])?;
+        let vectors_end = ids_end.checked_add(vector_bytes_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IVF-HNSW-FLAT vector payload length overflow",
+            )
+        })?;
+        if vectors_end > payload.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("list {} has truncated vector payload", meta.list_id),
+            ));
+        }
+        let ids = decode_delta_varint_ids(base_id, &payload[base_header_len..ids_end], meta.count)?;
+        let vectors = bytes_to_f32_vec(&payload[ids_end..vectors_end])?;
         let graph = decode_graph(
-            &payload[ids_bytes_len + vector_bytes_len..],
+            &payload[vectors_end..],
             vectors.clone(),
             meta.count,
             self.d,
@@ -833,8 +923,128 @@ fn validate_index_shape(index: &IVFHNSWFlatIndex) -> io::Result<()> {
     Ok(())
 }
 
-fn list_payload_len(count: usize, d: usize, graph_bytes_len: usize) -> io::Result<usize> {
-    let id_bytes = checked_list_bytes(count, 8)?;
+struct SortedFlatGraphList {
+    ids: Vec<i64>,
+    id_bytes: Vec<u8>,
+    vectors: Vec<f32>,
+    graph_bytes: Vec<u8>,
+}
+
+fn build_sorted_flat_graph_list(
+    index: &IVFHNSWFlatIndex,
+    list_id: usize,
+) -> io::Result<SortedFlatGraphList> {
+    let count = index.flat.ids[list_id].len();
+    if count == 0 {
+        return Ok(SortedFlatGraphList {
+            ids: Vec::new(),
+            id_bytes: Vec::new(),
+            vectors: Vec::new(),
+            graph_bytes: Vec::new(),
+        });
+    }
+
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by_key(|&idx| index.flat.ids[list_id][idx]);
+
+    let ids: Vec<i64> = order
+        .iter()
+        .map(|&idx| index.flat.ids[list_id][idx])
+        .collect();
+    let (_, id_bytes) = encode_delta_varint_ids(&ids);
+
+    let mut vectors = Vec::with_capacity(count * index.flat.d);
+    for &idx in &order {
+        vectors.extend_from_slice(
+            &index.flat.vectors[list_id][idx * index.flat.d..(idx + 1) * index.flat.d],
+        );
+    }
+    let old_to_new = old_to_new_order(&order);
+    let source_graph = index.graphs[list_id].as_ref().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("list {} is missing HNSW graph", list_id),
+        )
+    })?;
+    let graph = reorder_graph(
+        source_graph,
+        &order,
+        &old_to_new,
+        vectors.clone(),
+        index.flat.d,
+        index.flat.metric,
+        index.hnsw_params,
+    )?;
+    let graph_bytes = encode_graph(Some(&graph))?;
+
+    Ok(SortedFlatGraphList {
+        ids,
+        id_bytes,
+        vectors,
+        graph_bytes,
+    })
+}
+
+fn old_to_new_order(order: &[usize]) -> Vec<usize> {
+    let mut old_to_new = vec![0; order.len()];
+    for (new_idx, &old_idx) in order.iter().enumerate() {
+        old_to_new[old_idx] = new_idx;
+    }
+    old_to_new
+}
+
+fn reorder_graph(
+    graph: &HnswGraph,
+    order: &[usize],
+    old_to_new: &[usize],
+    vectors: Vec<f32>,
+    d: usize,
+    metric: MetricType,
+    hnsw_params: HnswBuildParams,
+) -> io::Result<HnswGraph> {
+    let levels: Vec<usize> = order
+        .iter()
+        .map(|&old_idx| graph.levels()[old_idx])
+        .collect();
+    let neighbors: Vec<Vec<Vec<usize>>> = order
+        .iter()
+        .map(|&old_idx| {
+            graph.neighbors()[old_idx]
+                .iter()
+                .map(|level_neighbors| {
+                    level_neighbors
+                        .iter()
+                        .map(|&neighbor| old_to_new[neighbor])
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+    HnswGraph::from_parts(
+        vectors,
+        order.len(),
+        d,
+        metric,
+        levels,
+        neighbors,
+        old_to_new[graph.entry_point()],
+        graph.max_observed_level(),
+        hnsw_params,
+    )
+}
+
+fn list_payload_len(
+    count: usize,
+    d: usize,
+    id_bytes_len: usize,
+    graph_bytes_len: usize,
+) -> io::Result<usize> {
+    let id_bytes = 12usize.checked_add(id_bytes_len).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IVF-HNSW-FLAT ID payload length overflow",
+        )
+    })?;
     let vector_bytes = checked_list_bytes(
         count,
         d.checked_mul(4).ok_or_else(|| {
@@ -857,20 +1067,66 @@ fn list_payload_len(count: usize, d: usize, graph_bytes_len: usize) -> io::Resul
 
 #[cfg(test)]
 mod tests {
+    use super::REQUIRED_FLAGS;
     use crate::distance::MetricType;
-    use crate::hnsw::HnswBuildParams;
-    use crate::index_io_util::decode_graph;
+    use crate::hnsw::{HnswBuildParams, HnswGraph};
+    use crate::index_io_util::{decode_graph, encode_graph, encode_graph_u32_for_size_estimate};
     use crate::io::{PosWriter, ReadRequest, SeekRead};
     use crate::ivfhnswflat::IVFHNSWFlatIndex;
     use crate::ivfhnswflat_io::{
         search_batch_ivfhnswflat_reader, search_batch_ivfhnswflat_reader_roaring_filter,
         write_ivfhnswflat_index, IVFHNSWFlatIndexReader, IVF_HNSW_FLAT_HEADER_SIZE,
+        IVF_HNSW_FLAT_MAGIC, IVF_HNSW_FLAT_VERSION,
     };
     use roaring::RoaringTreemap;
     use std::io;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn test_ivfhnswflat_reader_rejects_missing_required_flags() {
+        let mut buf = vec![0u8; IVF_HNSW_FLAT_HEADER_SIZE];
+        buf[0..4].copy_from_slice(&IVF_HNSW_FLAT_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&IVF_HNSW_FLAT_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&2i32.to_le_bytes());
+        buf[12..16].copy_from_slice(&1i32.to_le_bytes());
+        buf[16..20].copy_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf[20..28].copy_from_slice(&0i64.to_le_bytes());
+        buf[28..32].copy_from_slice(&2i32.to_le_bytes());
+        buf[32..36].copy_from_slice(&8i32.to_le_bytes());
+        buf[36..40].copy_from_slice(&3i32.to_le_bytes());
+        buf[40..44].copy_from_slice(&0u32.to_le_bytes());
+
+        let err = match IVFHNSWFlatIndexReader::open(Cursor::new(buf)) {
+            Ok(_) => panic!("missing required flags should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("requires delta-varint IDs and graph v1"));
+    }
+
+    #[test]
+    fn test_ivfhnswflat_reader_rejects_unknown_flags() {
+        let mut buf = vec![0u8; IVF_HNSW_FLAT_HEADER_SIZE];
+        buf[0..4].copy_from_slice(&IVF_HNSW_FLAT_MAGIC.to_le_bytes());
+        buf[4..8].copy_from_slice(&IVF_HNSW_FLAT_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&2i32.to_le_bytes());
+        buf[12..16].copy_from_slice(&1i32.to_le_bytes());
+        buf[16..20].copy_from_slice(&(MetricType::L2 as u32).to_le_bytes());
+        buf[20..28].copy_from_slice(&0i64.to_le_bytes());
+        buf[28..32].copy_from_slice(&2i32.to_le_bytes());
+        buf[32..36].copy_from_slice(&8i32.to_le_bytes());
+        buf[36..40].copy_from_slice(&3i32.to_le_bytes());
+        buf[40..44].copy_from_slice(&(REQUIRED_FLAGS | (1 << 31)).to_le_bytes());
+
+        let err = match IVFHNSWFlatIndexReader::open(Cursor::new(buf)) {
+            Ok(_) => panic!("unknown flags should be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("Unsupported IVF_HNSW_FLAT flags"));
+    }
 
     #[test]
     fn test_ivfhnswflat_write_read_search_roundtrip() {
@@ -1274,6 +1530,55 @@ mod tests {
     }
 
     #[test]
+    fn test_ivfhnswflat_graph_delta_varint_reduces_graph_bytes() {
+        let d = 2;
+        let n = 128;
+        let data: Vec<f32> = (0..n).flat_map(|i| [i as f32, 0.0]).collect();
+        let params = HnswBuildParams {
+            m: 8,
+            ef_construction: 32,
+            max_level: 4,
+        };
+        let graph = HnswGraph::build(&data, n, d, MetricType::L2, params).unwrap();
+
+        let fixed = encode_graph_u32_for_size_estimate(&graph).unwrap();
+        let compressed = encode_graph(Some(&graph)).unwrap();
+
+        assert!(compressed.len() < fixed.len());
+        assert!(compressed.len() * 2 < fixed.len());
+    }
+
+    #[test]
+    #[ignore]
+    fn print_ivfhnswflat_graph_delta_varint_size_report() {
+        let d = 8;
+        for n in [128usize, 1_024, 4_096] {
+            let data: Vec<f32> = (0..n)
+                .flat_map(|i| {
+                    (0..d).map(move |j| {
+                        let bucket = (i % 64) as f32;
+                        bucket * 0.01 + i as f32 * 0.0001 + j as f32 * 0.001
+                    })
+                })
+                .collect();
+            let params = HnswBuildParams {
+                m: 16,
+                ef_construction: 64,
+                max_level: 5,
+            };
+            let graph = HnswGraph::build(&data, n, d, MetricType::L2, params).unwrap();
+            let fixed = encode_graph_u32_for_size_estimate(&graph).unwrap();
+            let compressed = encode_graph(Some(&graph)).unwrap();
+            println!(
+                "n={n}, fixed_u32={} bytes, delta_varint={} bytes, saved={:.1}%",
+                fixed.len(),
+                compressed.len(),
+                100.0 - (compressed.len() as f64 * 100.0 / fixed.len() as f64)
+            );
+        }
+    }
+
+    #[test]
     fn test_ivfhnswflat_decoder_rejects_level_above_hnsw_max_before_allocation() {
         let params = HnswBuildParams {
             m: 2,
@@ -1281,10 +1586,11 @@ mod tests {
             max_level: 3,
         };
         let mut graph_bytes = Vec::new();
-        append_u32(&mut graph_bytes, 1);
-        append_u32(&mut graph_bytes, 0);
-        append_u32(&mut graph_bytes, 0);
-        append_u32(&mut graph_bytes, params.max_level as u32 + 1);
+        append_graph_header(&mut graph_bytes);
+        append_u32_varint(&mut graph_bytes, 1);
+        append_u32_varint(&mut graph_bytes, 0);
+        append_u32_varint(&mut graph_bytes, 0);
+        append_u32_varint(&mut graph_bytes, params.max_level as u32 + 1);
 
         let err =
             decode_graph(&graph_bytes, vec![0.0, 0.0], 1, 2, MetricType::L2, params).unwrap_err();
@@ -1301,17 +1607,54 @@ mod tests {
             max_level: 3,
         };
         let mut graph_bytes = Vec::new();
-        append_u32(&mut graph_bytes, 1);
-        append_u32(&mut graph_bytes, 0);
-        append_u32(&mut graph_bytes, 0);
-        append_u32(&mut graph_bytes, 0);
-        append_u32(&mut graph_bytes, (params.m * 2) as u32 + 1);
+        append_graph_header(&mut graph_bytes);
+        append_u32_varint(&mut graph_bytes, 1);
+        append_u32_varint(&mut graph_bytes, 0);
+        append_u32_varint(&mut graph_bytes, 0);
+        append_u32_varint(&mut graph_bytes, 0);
+        append_u32_varint(&mut graph_bytes, (params.m * 2) as u32 + 1);
 
         let err =
             decode_graph(&graph_bytes, vec![0.0, 0.0], 1, 2, MetricType::L2, params).unwrap_err();
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("degree"));
+    }
+
+    #[test]
+    fn test_ivfhnswflat_decoder_rejects_truncated_graph_varint() {
+        let params = HnswBuildParams {
+            m: 2,
+            ef_construction: 8,
+            max_level: 3,
+        };
+        let mut graph_bytes = Vec::new();
+        append_graph_header(&mut graph_bytes);
+        graph_bytes.push(0x81);
+
+        let err =
+            decode_graph(&graph_bytes, vec![0.0, 0.0], 1, 2, MetricType::L2, params).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("truncated HNSW graph varint"));
+    }
+
+    #[test]
+    fn test_ivfhnswflat_decoder_rejects_oversized_graph_varint() {
+        let params = HnswBuildParams {
+            m: 2,
+            ef_construction: 8,
+            max_level: 3,
+        };
+        let mut graph_bytes = Vec::new();
+        append_graph_header(&mut graph_bytes);
+        graph_bytes.extend_from_slice(&[0xff; 10]);
+
+        let err =
+            decode_graph(&graph_bytes, vec![0.0, 0.0], 1, 2, MetricType::L2, params).unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("varint exceeds u64 limit"));
     }
 
     #[test]
@@ -1364,7 +1707,17 @@ mod tests {
         }
     }
 
-    fn append_u32(buf: &mut Vec<u8>, value: u32) {
-        buf.extend_from_slice(&value.to_le_bytes());
+    fn append_u32_varint(buf: &mut Vec<u8>, mut value: u32) {
+        while value >= 0x80 {
+            buf.push((value as u8 & 0x7f) | 0x80);
+            value >>= 7;
+        }
+        buf.push(value as u8);
+    }
+
+    fn append_graph_header(buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&0x48574752u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
     }
 }
